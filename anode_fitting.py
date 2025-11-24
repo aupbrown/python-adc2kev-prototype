@@ -1,182 +1,261 @@
 import numpy as np
+import matplotlib.pyplot as plt
 from scipy.special import erf
 from scipy.optimize import curve_fit
-import matplotlib.pyplot as plt
-from anode_fit import photopeak_model
 
-import numpy as np
-from scipy.optimize import curve_fit
-from anode_fit import photopeak_model
-
-def fit_one_channel3(bin_centers, hist, auto_region=True, lower_bound=None, upper_bound=None):
+def photopeak_model(x, H, x0, sigma, sigma_e, t, h, B):
     """
-    Fit histogram with robust bounds checking and quality filters.
+    Photopeak model WITH continuity enforcement at transition.
     """
+    boundary = x0 - t
+    mask_right = x >= boundary
+    mask_left = ~mask_right
     
-    # ==== Quality Check 1: Minimum total counts ====
-    total_counts = np.sum(hist)
-    if total_counts < 100:
-        print(f"  ✗ Insufficient statistics: {total_counts:.0f} total counts")
-        return None, None, None, None
+    F = np.zeros_like(x, dtype=float)
     
-    if auto_region:
-        # Find the peak
-        peak_idx = np.argmax(hist)
-        peak_pos = bin_centers[peak_idx]
-        peak_height = hist[peak_idx]
+    # RIGHT SIDE (x >= x0 - t): Gaussian region
+    if np.any(mask_right):
+        xr = x[mask_right]
+        gaussian = np.exp(-((xr - x0)**2) / (2 * sigma**2))
+        erf_arg = -((xr - x0)**2) / (2 * sigma_e**2)
+        erf_arg = np.clip(erf_arg, -10, 10)
+        erf_term = erf(erf_arg)
+        F[mask_right] = H * (gaussian + h * erf_term) + B
+    
+    # LEFT SIDE (x < x0 - t): Exponential tail with continuity fix
+    if np.any(mask_left):
+        xl = x[mask_left]
         
-        # ==== Quality Check 2: Minimum peak height ====
-        if peak_height < 10:
-            print(f"  ✗ Peak too low: {peak_height:.0f} counts")
-            return None, None, None, None
+        # Calculate what the right-side formula gives at transition
+        gauss_at_t = np.exp(-(t**2) / (2 * sigma**2))
+        erf_arg_at_t = -(t**2) / (2 * sigma_e**2)
+        erf_arg_at_t = np.clip(erf_arg_at_t, -10, 10)
+        erf_at_t = erf(erf_arg_at_t)
+        right_value_at_t = H * (gauss_at_t + h * erf_at_t) + B
         
-        # Estimate width from FWHM
-        half_max = peak_height / 2
-        above_half = hist > half_max
+        # Calculate what the left-side formula would give at transition
+        exp_at_t_arg = (t * (x0 - t)) / (2 * sigma**2)
+        exp_at_t_arg = np.clip(exp_at_t_arg, -100, 10)
+        exp_at_t = np.exp(exp_at_t_arg)
+        left_value_at_t = H * (exp_at_t + h * erf_at_t) + B
         
-        if np.any(above_half):
-            left_idx = np.where(above_half)[0][0]
-            right_idx = np.where(above_half)[0][-1]
-            estimated_width = bin_centers[right_idx] - bin_centers[left_idx]
+        # Scale factor to enforce continuity
+        if abs(left_value_at_t) > 1e-10:
+            continuity_scale = right_value_at_t / left_value_at_t
         else:
-            estimated_width = 200
+            continuity_scale = 1.0
         
-        # ==== Quality Check 3: Peak width sanity ====
-        # A real photopeak should have FWHM between ~20-400 ADC units
-        if estimated_width < 10 or estimated_width > 800:
-            print(f"  ✗ Unrealistic peak width: {estimated_width:.0f} ADC")
-            return None, None, None, None
+        # Apply paper's formula with scaling
+        exp_arg = (t * (2*xl - x0 + t)) / (2 * sigma**2)
+        exp_arg = np.clip(exp_arg, -100, 10)
+        exp_tail = np.exp(exp_arg)
         
-        # Wider range: peak ± 10*width to capture tails
-        lower_bound = max(bin_centers[0], peak_pos - 10 * estimated_width)
-        upper_bound = min(bin_centers[-1], peak_pos + 5 * estimated_width)
+        erf_arg = -((xl - x0)**2) / (2 * sigma_e**2)
+        erf_arg = np.clip(erf_arg, -10, 10)
+        erf_term = erf(erf_arg)
         
-        # ==== Quality Check 4: Fitting range sanity ====
-        fitting_range = upper_bound - lower_bound
-        if fitting_range > 2000:  # More than half the ADC range is suspicious
-            print(f"  ✗ Fitting range too wide: {fitting_range:.0f} ADC")
-            return None, None, None, None
-        
-        print(f"Auto-detected region: [{lower_bound:.0f}, {upper_bound:.0f}]")
+        F[mask_left] = continuity_scale * (H * (exp_tail + h * erf_term) + B)
     
-    # Apply bounds
-    mask = (bin_centers >= lower_bound) & (bin_centers <= upper_bound)
-    hist_fit = hist[mask]
-    bins_fit = bin_centers[mask]
-    
-    # Background estimate
-    background_est = np.median(hist_fit[:min(20, len(hist_fit)//4)])
-    
-    # Lower threshold
-    threshold = max(0.5, background_est)
-    
-    significant_mask = hist_fit > threshold
-    n_significant = np.sum(significant_mask)
-    
-    print(f"Bins in range: {len(bins_fit)}, Significant bins: {n_significant}")
-    print(f"Background estimate: {background_est:.2f}, Threshold: {threshold:.2f}")
-    
-    # Require at least 25 significant bins
-    min_bins = 25
-    if n_significant < min_bins:
-        print(f"Warning: Only {n_significant} significant bins (need >{min_bins})")
-        # Try with all bins, but this is risky
-        if len(bins_fit) < min_bins:
-            print(f"  ✗ Even total bins ({len(bins_fit)}) < minimum")
-            return None, None, None, None
-    
-    # Initial guesses
-    H0 = hist_fit.max()
-    x0_0 = bins_fit[np.argmax(hist_fit)]
-    
-    # Sigma from FWHM
-    half_max = H0 / 2
-    above_half = hist_fit > half_max
-    if np.sum(above_half) > 2:
-        fwhm = np.sum(above_half) * (bins_fit[1] - bins_fit[0])
-        sigma0 = fwhm / 2.355
-    else:
-        sigma0 = 50
-    
-    sigma0 = max(sigma0, 20)  # Minimum sigma = 20
-    sigma0 = min(sigma0, 200)  # Maximum sigma = 200 (cap for sanity)
-    
-    sigma_e0 = sigma0 * 2
-    t0 = sigma0 * 1.5
-    h0 = 0.3
-    B0 = max(0.1, background_est)
-    
-    # ==== CRITICAL: Ensure initial guesses are within bounds ====
-    # We need to make sure our bounds can accommodate the initial guesses
-    
-    # Dynamic bounds based on initial guesses
-    H_low = max(0.01 * H0, 0.1)
-    H_high = max(5 * H0, 100)
-    
-    x0_low = max(bin_centers[0], x0_0 - 300)
-    x0_high = min(bin_centers[-1], x0_0 + 300)
-    
-    sigma_low = 1
-    sigma_high = max(300, sigma0 * 3)  # Make sure it can fit initial guess
-    
-    sigma_e_low = 10
-    sigma_e_high = max(500, sigma_e0 * 2)  # Make sure it can fit initial guess
-    
-    t_low = 1
-    t_high = max(300, t0 * 2)  # Make sure it can fit initial guess
-    
-    h_low = 0
-    h_high = 5
-    
-    B_low = 0
-    B_high = max(10, B0 * 10)
-    
-    p0 = [H0, x0_0, sigma0, sigma_e0, t0, h0, B0]
-    
-    bounds = (
-        [H_low, x0_low, sigma_low, sigma_e_low, t_low, h_low, B_low],
-        [H_high, x0_high, sigma_high, sigma_e_high, t_high, h_high, B_high]
-    )
-    
-    # Verify initial guesses are within bounds
-    for i, (param, p_val, low, high) in enumerate(zip(
-        ['H', 'x0', 'σ', 'σe', 't', 'h', 'B'],
-        p0, bounds[0], bounds[1]
-    )):
-        if not (low <= p_val <= high):
-            print(f"  ✗ Initial guess {param}={p_val:.2f} outside bounds [{low:.2f}, {high:.2f}]")
-            return None, None, None, None
-    
-    print(f"\nInitial guesses:")
-    print(f"  H={H0:.1f}, x0={x0_0:.1f}, σ={sigma0:.1f}")
-    print(f"  σe={sigma_e0:.1f}, t={t0:.1f}, h={h0:.2f}, B={B0:.2f}")
-    
-    try:
-        # Use Poisson weights
-        weights = 1.0 / np.sqrt(hist_fit + 1)
-        
-        popt, pcov = curve_fit(
-            photopeak_model,
-            bins_fit, hist_fit,
-            p0=p0,
-            bounds=bounds,
-            sigma=weights,
-            absolute_sigma=False,
-            maxfev=30000,
-            method='trf'
-        )
-        
-        print(f"  ✓ Fit succeeded")
-        return popt, pcov, bins_fit, hist_fit
-        
-    except RuntimeError as e:
-        print(f"  ✗ Fit failed: {e}")
-        return None, None, None, None
-    except ValueError as e:
-        print(f"  ✗ Bounds error: {e}")
-        return None, None, None, None
+    return F
 
-def fit_one_channel2(bin_centers, hist, auto_region=True, lower_bound=None, upper_bound=None):
+def plot_fit_components(bin_centers, hist, popt, key):
+    H, x0, sigma, sigma_e, t, h, B = popt
+    x = bin_centers
+
+    # Compute masks again for components
+    boundary = x0 - t
+    mask_right = x >= boundary
+    mask_left  = ~mask_right
+
+    gaussian = np.zeros_like(x)
+    exp_tail = np.zeros_like(x)
+    erf_component = np.zeros_like(x)
+    background = np.ones_like(x) * B
+
+    # Gaussian component on right side
+    gaussian[mask_right] = H * np.exp(-((x[mask_right] - x0)**2) / (2*sigma**2))
+
+    # Exponential tail on left side
+    exp_arg = (t*(2*x[mask_left] - x0 + t)) / (2*sigma**2)
+    exp_tail[mask_left] = H * np.exp(exp_arg - np.max(exp_arg))  # normalized
+
+    # Error function exists on both sides
+    erf_component = H*h*erf(-(x - x0) / (np.sqrt(2)*sigma_e))
+
+    # Background
+    background = np.ones_like(x) * B
+
+    # Full model
+    F = photopeak_model(x, H, x0, sigma, sigma_e, t, h, B)
+
+    # ------------------------ PLOT ------------------------
+    plt.figure(figsize=(11,6))
+    plt.step(x, hist, where='mid', label="Histogram", linewidth=1.5)
+
+    plt.plot(x, H*gaussian, label="Gaussian", color="black")
+    plt.plot(x, H*exp_tail, label="Exponential Tail", color="purple")
+    plt.plot(x, H*h*erf_component, label="Error Function Term", color="orange")
+    plt.plot(x, background, label="Background", color="green")
+    plt.plot(x, F, label="Full Fit (Shape Function)", color="red", linewidth=2)
+    plt.xlabel("ADC Value")
+    plt.ylabel("Counts")
+    plt.title(f"Fit for Channel {key}")
+    plt.legend()
+    plt.grid(alpha=0.25)
+    plt.show()
+    
+def calculate_chi_squared(bin_centers, hist_counts, popt, reduced=True):
+    """
+    Calculate chi-squared goodness of fit.
+    
+    Parameters:
+    -----------
+    bin_centers : array
+        ADC bin center values (x_i)
+    hist_counts : array
+        Histogram counts (observed data)
+    popt : array
+        Fitted parameters [H, x0, sigma, sigma_e, t, h, B]
+    reduced : bool
+        If True, return reduced chi-squared (chi²/dof)
+        
+    Returns:
+    --------
+    chi2 : float
+        Chi-squared value (or reduced chi-squared if reduced=True)
+    """
+    # Get fitted values F(x_i)
+    F_xi = photopeak_model(bin_centers, *popt)
+    
+    # Measurement error: σ_xi = sqrt(counts)
+    # For zero or very low counts, use minimum of 1 to avoid division by zero
+    sigma_xi = np.sqrt(hist_counts)
+    sigma_xi = np.where(sigma_xi > 0, sigma_xi, 1.0)
+    
+    # Chi-squared: sum of [(x_i - F(x_i))^2 / σ_xi^2]
+    chi2 = np.sum(((hist_counts - F_xi)**2) / (sigma_xi**2))
+    
+    if reduced:
+        # Degrees of freedom = number of data points - number of parameters
+        n_params = len(popt)
+        dof = len(bin_centers) - n_params
+        if dof > 0:
+            chi2 = chi2 / dof
+        else:
+            print("Warning: degrees of freedom <= 0")
+    
+    return chi2
+
+
+def calculate_chi_squared_only_fitted_region(bin_centers, hist_counts, popt, reduced=True):
+    """
+    Calculate chi-squared only for bins with significant counts (above threshold).
+    This is more appropriate when you filtered out low-count bins before fitting.
+    
+    Parameters:
+    -----------
+    bin_centers : array
+        ADC bin center values
+    hist_counts : array
+        Histogram counts
+    popt : array
+        Fitted parameters [H, x0, sigma, sigma_e, t, h, B]
+    reduced : bool
+        If True, return reduced chi-squared
+        
+    Returns:
+    --------
+    chi2 : float
+        Chi-squared value
+    """
+    # Only include bins with counts > threshold (e.g., background + 3*sigma)
+    background = popt[6]  # B parameter
+    threshold = background + 3 * np.sqrt(background + 1)
+    
+    mask = hist_counts > threshold
+    
+    if np.sum(mask) < len(popt):
+        print("Warning: fewer valid bins than parameters!")
+        return np.inf
+    
+    bin_centers_valid = bin_centers[mask]
+    hist_valid = hist_counts[mask]
+    
+    # Calculate chi-squared on valid bins only
+    F_xi = photopeak_model(bin_centers_valid, *popt)
+    sigma_xi = np.sqrt(hist_valid)
+    sigma_xi = np.where(sigma_xi > 0, sigma_xi, 1.0)
+    
+    chi2 = np.sum(((hist_valid - F_xi)**2) / (sigma_xi**2))
+    
+    if reduced:
+        dof = len(bin_centers_valid) - len(popt)
+        if dof > 0:
+            chi2 = chi2 / dof
+    
+    return chi2
+
+
+def print_fit_quality(bin_centers, hist_counts, popt):
+    """
+    Print comprehensive fit quality metrics.
+    
+    Parameters:
+    -----------
+    bin_centers : array
+        ADC bin centers
+    hist_counts : array
+        Histogram counts
+    popt : array
+        Fitted parameters [H, x0, sigma, sigma_e, t, h, B]
+    """
+    chi2 = calculate_chi_squared(bin_centers, hist_counts, popt, reduced=False)
+    chi2_reduced = calculate_chi_squared(bin_centers, hist_counts, popt, reduced=True)
+    
+    n_params = len(popt)
+    n_bins = len(bin_centers)
+    dof = n_bins - n_params
+    
+    print("\n" + "="*60)
+    print("FIT QUALITY ASSESSMENT")
+    print("="*60)
+    print(f"Number of bins:        {n_bins}")
+    print(f"Number of parameters:  {n_params}")
+    print(f"Degrees of freedom:    {dof}")
+    print(f"\nχ² (total):            {chi2:.2f}")
+    print(f"χ²/dof (reduced):      {chi2_reduced:.4f}")
+    
+    # Interpretation
+    print(f"\nInterpretation:")
+    if chi2_reduced < 1.5:
+        print("  ✓ Good fit (χ²/dof ≈ 1)")
+    elif chi2_reduced < 3.0:
+        print("  ⚠ Acceptable fit (χ²/dof slightly elevated)")
+    else:
+        print("  ✗ Poor fit (χ²/dof >> 1)")
+        print("    Consider:")
+        print("    - Different initial guesses")
+        print("    - Checking for systematic issues")
+        print("    - Model may not describe data well")
+    
+    # Residual analysis
+    F_xi = photopeak_model(bin_centers, *popt)
+    residuals = hist_counts - F_xi
+    sigma_xi = np.sqrt(hist_counts)
+    sigma_xi = np.where(sigma_xi > 0, sigma_xi, 1.0)
+    normalized_residuals = residuals / sigma_xi
+    
+    print(f"\nResidual statistics:")
+    print(f"  Mean residual:         {np.mean(residuals):.2f}")
+    print(f"  Std of residuals:      {np.std(residuals):.2f}")
+    print(f"  Max |residual|:        {np.max(np.abs(residuals)):.2f}")
+    print(f"  Mean normalized res.:  {np.mean(normalized_residuals):.4f}")
+    print(f"  Std normalized res.:   {np.std(normalized_residuals):.4f}")
+    print("="*60)
+    
+    return chi2, chi2_reduced
+
+def fit_one_channel(bin_centers, hist, auto_region=True, lower_bound=None, upper_bound=None):
     """
     Fit histogram with adjusted thresholds for low-statistics data.
     """
@@ -231,6 +310,10 @@ def fit_one_channel2(bin_centers, hist, auto_region=True, lower_bound=None, uppe
         hist_fit_all = hist_fit
         bins_fit_all = bins_fit
     
+    if len(bins_fit_all) < min_bins:
+        print(f"ERROR: Only {len(bins_fit_all)} bins available. Need wider range!")
+        return None, None, None, None
+    
     # Initial guesses
     H0 = hist_fit_all.max()
     x0_0 = bins_fit_all[np.argmax(hist_fit_all)]
@@ -244,7 +327,7 @@ def fit_one_channel2(bin_centers, hist, auto_region=True, lower_bound=None, uppe
     else:
         sigma0 = 50  # Default for wide peaks
     
-    sigma0 = max(sigma0, 20)  # Minimum sigma = 20
+    sigma0 = max(sigma0, 20)  # Minimum sigma
     
     sigma_e0 = sigma0 * 2
     t0 = sigma0 * 1.5
@@ -257,19 +340,10 @@ def fit_one_channel2(bin_centers, hist, auto_region=True, lower_bound=None, uppe
     print(f"  H={H0:.1f}, x0={x0_0:.1f}, σ={sigma0:.1f}")
     print(f"  σe={sigma_e0:.1f}, t={t0:.1f}, h={h0:.2f}, B={B0:.2f}")
     
-    # Setting bounds for curve_fit()
-    
-    #making sure that for edge cases, lower bound < upper bound
-    if H0 == 0:
-        H_low = 0
-        H_high = 100
-    else:
-        H_low = H0 * 0.01
-        H_high = H0 * 5
-        
+    # Wider bounds
     bounds = (
-        [H_low,   x0_0-200,  1,    10,   1,    0,     0],
-        [H_high,      x0_0+200,  300,  500,  300,  5,     max(10, B0*10)]
+        [H0*0.01,   x0_0-200,  1,    10,   1,    0,     0],
+        [H0*5,      x0_0+200,  300,  500,  150,  5,     max(10, B0*10)]
     )
     
     try:
@@ -286,6 +360,9 @@ def fit_one_channel2(bin_centers, hist, auto_region=True, lower_bound=None, uppe
             maxfev=30000,
             method='trf'
         )
+        
+        # Check continuity
+        check_continuity(popt)
         
         return popt, pcov, bins_fit_all, hist_fit_all
         
@@ -458,59 +535,3 @@ def print_photopeak_results(results, source_energy_kev=None):
     print(f"  Background: {results['background']:.2f} counts/bin")
     
     print("="*60)
-
-
-def find_all_photopeaks(histograms, bin_centers, source_energy_kev=662):
-    """
-    Fit all channels and extract photopeak positions.
-    
-    Parameters:
-    -----------
-    histograms : dict
-        Dictionary of {channel_key: histogram_array}
-    bin_centers : array
-        ADC bin centers
-    source_energy_kev : float
-        Known source energy (default: 662 for Cs-137)
-        
-    Returns:
-    --------
-    DataFrame with photopeak info for all channels
-    """
-    results_list = []
-    
-    for channel_key, hist in histograms.items():
-        print(f"\nProcessing channel {channel_key}...")
-        
-        # Fit the channel
-        popt, pcov = fit_one_channel2(bin_centers, hist, 
-                                       lower_bound=0, 
-                                       upper_bound=bin_centers.max())
-        
-        if popt is None:
-            print(f"  Fit failed for channel {channel_key}")
-            continue
-        
-        # Extract photopeak info
-        peak_info = extract_photopeak_info(popt, pcov)
-        
-        # Calculate calibration
-        calibration = source_energy_kev / peak_info['photopeak_position']
-        
-        # Store results
-        results_list.append({
-            'channel': channel_key,
-            'photopeak_adc': peak_info['photopeak_position'],
-            'photopeak_unc': peak_info['photopeak_uncertainty'],
-            'fwhm_adc': peak_info['fwhm'],
-            'resolution_pct': peak_info['resolution_percent'],
-            'calibration_kev_per_adc': calibration,
-            'net_area': peak_info['net_peak_area'],
-            'background': peak_info['background']
-        })
-    
-    # Convert to DataFrame for easy analysis
-    import pandas as pd
-    df = pd.DataFrame(results_list)
-    
-    return df
