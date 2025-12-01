@@ -80,9 +80,7 @@ def main():
         hist2 = anode_hists2[channel]
 
         # ===== TRY AUTO-REGION FIRST =====
-        popt1, pcov1, bins_fit1, hist_fit1 = fit_one_channel2(
-            anode_bin_centers1, hist1, auto_region=False, lower_bound=lower_bound1, upper_bound=upper_bound1
-        )
+        popt1, pcov1, bins_fit1, hist_fit1 = fit_one_channel2(anode_bin_centers1, hist1, auto_region=True)
     
         # If auto failed, try manual bounds as fallback
         if popt1 is None:
@@ -96,9 +94,9 @@ def main():
             )
     
         # ===== SAME FOR SECOND ISOTOPE =====
-        popt2, pcov2, bins_fit2, hist_fit2 = fit_one_channel2(
-            anode_bin_centers2, hist2, auto_region=False, lower_bound=lower_bound2, upper_bound=upper_bound2
-        )
+        
+        # try auto-bounds first
+        popt2, pcov2, bins_fit2, hist_fit2 = fit_one_channel2(anode_bin_centers2, hist2, auto_region=True)
     
         # If auto failed, try manual bounds as fallback
         if popt2 is None:

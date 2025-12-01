@@ -181,23 +181,15 @@ def fit_one_channel2(bin_centers, hist, auto_region=True, lower_bound=None, uppe
     Fit histogram with adjusted thresholds for low-statistics data.
     """
     if auto_region:
-        # Find the peak
-        peak_idx = np.argmax(hist)
+        # Find the peak from values
+        
+        #find max that lies above ADC 2100
+        peak_idx = np.argmax(hist[bin_centers > 2100])
         peak_pos = bin_centers[peak_idx]
         
-        # Estimate width from FWHM
-        half_max = hist[peak_idx] / 2
-        above_half = hist > half_max
-        if np.any(above_half):
-            left_idx = np.where(above_half)[0][0]
-            right_idx = np.where(above_half)[0][-1]
-            estimated_width = bin_centers[right_idx] - bin_centers[left_idx]
-        else:
-            estimated_width = 200  # Wider default
-        
         # Wider range: peak ± 10*width to capture tails
-        lower_bound = max(bin_centers[0], peak_pos - 10 * estimated_width)
-        upper_bound = min(bin_centers[-1], peak_pos + 5 * estimated_width)
+        lower_bound = peak_pos - 200
+        upper_bound = peak_pos + 200
         
         print(f"Auto-detected region: [{lower_bound:.0f}, {upper_bound:.0f}]")
     
