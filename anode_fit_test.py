@@ -3,191 +3,146 @@ from scipy.special import erf
 from scipy.optimize import curve_fit
 import matplotlib.pyplot as plt
 from anode_fit import photopeak_model
+import multiprocessing as mp
 
-import numpy as np
-from scipy.optimize import curve_fit
-from anode_fit import photopeak_model
+def _worker_two_point_calibration(args):
+    """
+    Multiprocessing worker function that performs the two-point fit and calibration 
+    for a single channel. This contains the logic from the user's main loop.
+    
+    Args:
+        args (tuple): (channel_key, hist1, bin_centers1, kev1, hist2, bin_centers2, kev2, fit_func, peak_func)
+    """
+    channel, hist1, bin_centers1, kev1, hist2, bin_centers2, kev2, fit_func, peak_func = args
+    
+    # 1. Skip bad histograms (Low stats/Single spike checks - based on user's main script)
+    if np.count_nonzero(hist1) <= 1 or np.count_nonzero(hist2) <= 1:
+        return (channel, None, "Single spike/Zero counts")
+    
+    if np.sum(hist1) < 100 or np.sum(hist2) < 100:
+        return (channel, None, "Low statistics")
 
-def fit_one_channel3(bin_centers, hist, auto_region=True, lower_bound=None, upper_bound=None):
-    """
-    Fit histogram with robust bounds checking and quality filters.
-    """
-    
-    # ==== Quality Check 1: Minimum total counts ====
-    total_counts = np.sum(hist)
-    if total_counts < 100:
-        print(f"  ✗ Insufficient statistics: {total_counts:.0f} total counts")
-        return None, None, None, None
-    
-    if auto_region:
-        # Find the peak
-        peak_idx = np.argmax(hist)
-        peak_pos = bin_centers[peak_idx]
-        peak_height = hist[peak_idx]
-        
-        # ==== Quality Check 2: Minimum peak height ====
-        if peak_height < 10:
-            print(f"  ✗ Peak too low: {peak_height:.0f} counts")
-            return None, None, None, None
-        
-        # Estimate width from FWHM
-        half_max = peak_height / 2
-        above_half = hist > half_max
-        
-        if np.any(above_half):
-            left_idx = np.where(above_half)[0][0]
-            right_idx = np.where(above_half)[0][-1]
-            estimated_width = bin_centers[right_idx] - bin_centers[left_idx]
-        else:
-            estimated_width = 200
-        
-        # ==== Quality Check 3: Peak width sanity ====
-        # A real photopeak should have FWHM between ~20-400 ADC units
-        if estimated_width < 10 or estimated_width > 800:
-            print(f"  ✗ Unrealistic peak width: {estimated_width:.0f} ADC")
-            return None, None, None, None
-        
-        # Wider range: peak ± 10*width to capture tails
-        lower_bound = max(bin_centers[0], peak_pos - 10 * estimated_width)
-        upper_bound = min(bin_centers[-1], peak_pos + 5 * estimated_width)
-        
-        # ==== Quality Check 4: Fitting range sanity ====
-        fitting_range = upper_bound - lower_bound
-        if fitting_range > 2000:  # More than half the ADC range is suspicious
-            print(f"  ✗ Fitting range too wide: {fitting_range:.0f} ADC")
-            return None, None, None, None
-        
-        print(f"Auto-detected region: [{lower_bound:.0f}, {upper_bound:.0f}]")
-    
-    # Apply bounds
-    mask = (bin_centers >= lower_bound) & (bin_centers <= upper_bound)
-    hist_fit = hist[mask]
-    bins_fit = bin_centers[mask]
-    
-    # Background estimate
-    background_est = np.median(hist_fit[:min(20, len(hist_fit)//4)])
-    
-    # Lower threshold
-    threshold = max(0.5, background_est)
-    
-    significant_mask = hist_fit > threshold
-    n_significant = np.sum(significant_mask)
-    
-    print(f"Bins in range: {len(bins_fit)}, Significant bins: {n_significant}")
-    print(f"Background estimate: {background_est:.2f}, Threshold: {threshold:.2f}")
-    
-    # Require at least 25 significant bins
-    min_bins = 25
-    if n_significant < min_bins:
-        print(f"Warning: Only {n_significant} significant bins (need >{min_bins})")
-        # Try with all bins, but this is risky
-        if len(bins_fit) < min_bins:
-            print(f"  ✗ Even total bins ({len(bins_fit)}) < minimum")
-            return None, None, None, None
-    
-    # Initial guesses
-    H0 = hist_fit.max()
-    x0_0 = bins_fit[np.argmax(hist_fit)]
-    
-    # Sigma from FWHM
-    half_max = H0 / 2
-    above_half = hist_fit > half_max
-    if np.sum(above_half) > 2:
-        fwhm = np.sum(above_half) * (bins_fit[1] - bins_fit[0])
-        sigma0 = fwhm / 2.355
-    else:
-        sigma0 = 50
-    
-    sigma0 = max(sigma0, 20)  # Minimum sigma = 20
-    sigma0 = min(sigma0, 200)  # Maximum sigma = 200 (cap for sanity)
-    
-    sigma_e0 = sigma0 * 2
-    t0 = sigma0 * 1.5
-    h0 = 0.3
-    B0 = max(0.1, background_est)
-    
-    # ==== CRITICAL: Ensure initial guesses are within bounds ====
-    # We need to make sure our bounds can accommodate the initial guesses
-    
-    # Dynamic bounds based on initial guesses
-    H_low = max(0.01 * H0, 0.1)
-    H_high = max(5 * H0, 100)
-    
-    x0_low = max(bin_centers[0], x0_0 - 300)
-    x0_high = min(bin_centers[-1], x0_0 + 300)
-    
-    sigma_low = 1
-    sigma_high = max(300, sigma0 * 3)  # Make sure it can fit initial guess
-    
-    sigma_e_low = 10
-    sigma_e_high = max(500, sigma_e0 * 2)  # Make sure it can fit initial guess
-    
-    t_low = 1
-    t_high = max(300, t0 * 2)  # Make sure it can fit initial guess
-    
-    h_low = 0
-    h_high = 5
-    
-    B_low = 0
-    B_high = max(10, B0 * 10)
-    
-    p0 = [H0, x0_0, sigma0, sigma_e0, t0, h0, B0]
-    
-    bounds = (
-        [H_low, x0_low, sigma_low, sigma_e_low, t_low, h_low, B_low],
-        [H_high, x0_high, sigma_high, sigma_e_high, t_high, h_high, B_high]
+    # 2. Fit Histogram 1 (Isotope 1)
+    # Using fixed bounds from user's main script for 662 keV source (file1)
+    popt1, _, _, _ = fit_func(
+        bin_centers1, hist1, auto_region=False, 
+        lower_bound=1800, upper_bound=3200
     )
     
-    # Verify initial guesses are within bounds
-    for i, (param, p_val, low, high) in enumerate(zip(
-        ['H', 'x0', 'σ', 'σe', 't', 'h', 'B'],
-        p0, bounds[0], bounds[1]
-    )):
-        if not (low <= p_val <= high):
-            print(f"  ✗ Initial guess {param}={p_val:.2f} outside bounds [{low:.2f}, {high:.2f}]")
-            return None, None, None, None
+    # 3. Fit Histogram 2 (Isotope 2)
+    # Using fixed bounds from user's main script for 511 keV source (file2)
+    popt2, _, _, _ = fit_func(
+        bin_centers2, hist2, auto_region=False,
+        lower_bound=1500, upper_bound=2800
+    )
     
-    print(f"\nInitial guesses:")
-    print(f"  H={H0:.1f}, x0={x0_0:.1f}, σ={sigma0:.1f}")
-    print(f"  σe={sigma_e0:.1f}, t={t0:.1f}, h={h0:.2f}, B={B0:.2f}")
+    if popt1 is None or popt2 is None:
+        return (channel, None, "Fit function failed")
+
+    # 4. Extract Peak ADC Values
+    peak_info1 = peak_func(popt1, None) # pcov not needed for peak extraction
+    peak_info2 = peak_func(popt2, None)
+    adc1 = peak_info1['photopeak_position']
+    adc2 = peak_info2['photopeak_position']
+    
+    # 5. Validation Checks (from user's main script)
+    if adc1 <= 0 or adc2 <= 0:
+        return (channel, None, "Invalid peak ADC")
+    
+    # Ensure peaks are separated enough (user's check: abs(adc1 - adc2) < 50)
+    if abs(adc1 - adc2) < 50:
+        return (channel, None, "Peaks too close (Separation < 50 ADC)")
+    
+    # 6. Calculate Calibration Parameters (Linear Fit: keV = slope * ADC + intercept)
+    
+    # Calculate slope: (y2 - y1) / (x2 - x1)
+    # y = keV, x = ADC
+    slope = (kev1 - kev2) / (adc1 - adc2)
+    
+    # Calculate intercept: y - slope * x
+    intercept = kev2 - slope * adc2 
+    
+    # 7. Final Validation Checks (from user's main script)
+    if not np.isfinite(slope) or not np.isfinite(intercept) or slope <= 0 or slope > 2:
+        return (channel, None, "Invalid slope/intercept")
+    
+    # Success: Return the channel key and the serializable calibration parameters
+    return (channel, (float(slope), float(intercept)), "Success")
+
+
+def calibrate_anodes_in_parallel(
+    anode_hists1, anode_bin_centers1, kev1, 
+    anode_hists2, anode_bin_centers2, kev2, 
+    fit_func, peak_func, verbose=True
+):
+    """
+    Manages the parallel execution of the two-point calibration process 
+    for all common anode channels.
+    """
+    
+    common_anode_channels = set(anode_hists1.keys()).intersection(set(anode_hists2.keys()))
+    
+    if verbose:
+        print(f"\nStarting parallel two-point calibration for {len(common_anode_channels)} common channels...")
+    
+    # 1. Prepare tasks list for multiprocessing
+    tasks = []
+    for channel in common_anode_channels:
+        # Args for the worker function: (channel, hist1, bc1, kev1, hist2, bc2, kev2, fit_func, peak_func)
+        tasks.append((
+            channel, 
+            anode_hists1[channel], anode_bin_centers1, kev1, 
+            anode_hists2[channel], anode_bin_centers2, kev2, 
+            fit_func, peak_func
+        ))
+    
+    # 2. Execute parallel processing
+    num_cores = mp.cpu_count()
+    if verbose:
+        print(f"Using {num_cores} cores for parallel processing...")
+        
+    calibrations = {}
+    failed_fits = 0
     
     try:
-        # Use Poisson weights
-        weights = 1.0 / np.sqrt(hist_fit + 1)
+        # Using fork context for compatibility, especially on Unix/Linux
+        with mp.get_context('fork').Pool(num_cores) as pool:
+            # imap_unordered is best for distributing independent tasks
+            results = pool.imap_unordered(_worker_two_point_calibration, tasks)
+            
+            count = 0
+            for channel, result_tuple, reason in results:
+                count += 1
+                if result_tuple is not None:
+                    # result_tuple is (slope, intercept)
+                    calibrations[channel] = result_tuple
+                else:
+                    failed_fits += 1
+                    # Optional: log the reason for failure here if needed
+                
+                if verbose and count % 1000 == 0:
+                    print(f"  Processed {count}/{len(common_anode_channels)} channels...")
+                    
+    except Exception as e:
+        print(f"FATAL ERROR during parallel processing: {e}")
+        # Return whatever was processed so far
+        return calibrations, len(common_anode_channels) - len(calibrations)
+
+    if verbose:
+        print(f"Parallel calibration complete. Successfully calibrated {len(calibrations)} channels.")
         
-        popt, pcov = curve_fit(
-            photopeak_model,
-            bins_fit, hist_fit,
-            p0=p0,
-            bounds=bounds,
-            sigma=weights,
-            absolute_sigma=False,
-            maxfev=30000,
-            method='trf'
-        )
-        
-        print(f"  ✓ Fit succeeded")
-        return popt, pcov, bins_fit, hist_fit
-        
-    except RuntimeError as e:
-        print(f"  ✗ Fit failed: {e}")
-        return None, None, None, None
-    except ValueError as e:
-        print(f"  ✗ Bounds error: {e}")
-        return None, None, None, None
+    return calibrations, failed_fits
 
 def fit_one_channel2(bin_centers, hist, auto_region=True, lower_bound=None, upper_bound=None):
     """
-    Fit histogram with adjusted thresholds for low-statistics data.
+    FIXED VERSION: Ensures all initial guesses are within bounds.
     """
     if auto_region:
-        # Find the peak from values
-        
-        #find max that lies above ADC 2100
+        # Find the peak by searching for max bin idx that lies above ADC value 2100
         peak_idx = np.argmax(hist[bin_centers > 2100])
         peak_pos = bin_centers[peak_idx]
         
-        # Wider range: peak ± 10*width to capture tails
+        # Wider range: peak ± 200 to capture tails
         lower_bound = peak_pos - 200
         upper_bound = peak_pos + 200
         
@@ -202,7 +157,7 @@ def fit_one_channel2(bin_centers, hist, auto_region=True, lower_bound=None, uppe
     background_est = np.median(hist_fit[:min(20, len(hist_fit)//4)])
     
     # Lower threshold: just require counts > 0 OR background level
-    threshold = max(0.5, background_est)  # Much more permissive
+    threshold = max(0.5, background_est)
     
     significant_mask = hist_fit > threshold
     n_significant = np.sum(significant_mask)
@@ -210,18 +165,14 @@ def fit_one_channel2(bin_centers, hist, auto_region=True, lower_bound=None, uppe
     print(f"Bins in range: {len(bins_fit)}, Significant bins: {n_significant}")
     print(f"Background estimate: {background_est:.2f}, Threshold: {threshold:.2f}")
     
-    # Require at least 3x parameters
-    min_bins = 25  # 3-4x the number of parameters
+    # Require at least 25 significant bins
+    min_bins = 25
     if n_significant < min_bins:
         print(f"Warning: Only {n_significant} significant bins (need >{min_bins})")
         print("Trying with all bins in range...")
-        # Use all bins in range instead
-        hist_fit_all = hist_fit
-        bins_fit_all = bins_fit
-        n_significant = len(bins_fit_all)
-    else:
-        hist_fit_all = hist_fit
-        bins_fit_all = bins_fit
+    
+    hist_fit_all = hist_fit
+    bins_fit_all = bins_fit
     
     # Initial guesses
     H0 = hist_fit_all.max()
@@ -234,14 +185,17 @@ def fit_one_channel2(bin_centers, hist, auto_region=True, lower_bound=None, uppe
         fwhm = np.sum(above_half) * (bins_fit_all[1] - bins_fit_all[0])
         sigma0 = fwhm / 2.355
     else:
-        sigma0 = 50  # Default for wide peaks
+        sigma0 = 50
     
-    sigma0 = max(sigma0, 20)  # Minimum sigma = 20
+    sigma0 = max(sigma0, 20)
     
     sigma_e0 = sigma0 * 2
     t0 = sigma0 * 1.5
     h0 = 0.3
     B0 = max(0.1, background_est)
+    
+    # FIX: Ensure t0 is within reasonable bounds
+    t0 = min(t0, 250)  # Cap t0 so it doesn't exceed upper bound
     
     p0 = [H0, x0_0, sigma0, sigma_e0, t0, h0, B0]
     
@@ -250,23 +204,40 @@ def fit_one_channel2(bin_centers, hist, auto_region=True, lower_bound=None, uppe
     print(f"  σe={sigma_e0:.1f}, t={t0:.1f}, h={h0:.2f}, B={B0:.2f}")
     
     # Setting bounds for curve_fit()
-    
-    #making sure that for edge cases, lower bound < upper bound
     if H0 == 0:
         H_low = 0
         H_high = 100
     else:
         H_low = H0 * 0.01
         H_high = H0 * 5
-        
+    
+    # Ensure sigma_e0 fits within bounds
+    sigma_e_high = max(500, sigma_e0 * 1.2)
+    
+    # Ensure t0 fits within bounds  
+    t_high = max(300, t0 * 1.2)
+    
     bounds = (
-        [H_low,   x0_0-200,  1,    10,   1,    0,     0],
-        [H_high,      x0_0+200,  300,  500,  300,  5,     max(10, B0*10)]
+        [H_low,   x0_0-200,  1,    10,   1,      0,   0],
+        [H_high,  x0_0+200,  300,  sigma_e_high,  t_high,  5,   max(10, B0*10)]
     )
     
+    # Verify all initial guesses are within bounds
+    param_names = ['H', 'x0', 'σ', 'σe', 't', 'h', 'B']
+    for i, (name, val, low, high) in enumerate(zip(param_names, p0, bounds[0], bounds[1])):
+        if not (low <= val <= high):
+            print(f"⚠️  Initial {name}={val:.2f} outside bounds [{low:.2f}, {high:.2f}]")
+            p0[i] = np.clip(val, low, high)
+            print(f"   Clipped to {p0[i]:.2f}")
+    
     try:
+        
         # Use Poisson weights
         weights = 1.0 / np.sqrt(hist_fit_all + 1)
+        
+        # Dummy photopeak model - replace with your actual model
+        def photopeak_model(x, H, x0, sigma, sigma_e, t, h, B):
+            return H * np.exp(-0.5 * ((x - x0) / sigma) ** 2) + B
         
         popt, pcov = curve_fit(
             photopeak_model,
@@ -283,6 +254,9 @@ def fit_one_channel2(bin_centers, hist, auto_region=True, lower_bound=None, uppe
         
     except RuntimeError as e:
         print(f"Fit failed: {e}")
+        return None, None, None, None
+    except ValueError as e:
+        print(f"Bounds error: {e}")
         return None, None, None, None
 
 def check_continuity(popt):

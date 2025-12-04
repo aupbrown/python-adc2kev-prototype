@@ -1,4 +1,5 @@
 *.txt
 *.png
 *.json
+*.pyc
 .venv/

@@ -1,4 +1,3 @@
-import pandas as pd
 import numpy as np
 from scipy.stats import linregress
 from collections import defaultdict
@@ -11,7 +10,7 @@ import numpy as np
 def fit_one_cathode(hist_counts, bin_centers, use_auto_bounds=True):
     """
     Fit a cathode histogram using linear fit on the Compton edge.
-    This replicates the C++ MapADCToKeV::fitCathode logic.
+    This replicates the C++ logic.
     
     Parameters:
     -----------

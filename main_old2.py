@@ -56,7 +56,6 @@ def plot_calibration_validation(anode_hists, bin_centers, calibrations, kev, n_s
     print("\n📊 Generating calibration validation plots (keV x-axis)...")
     
     # Find successfully calibrated channels
-    # NOTE: The stored calibration tuple now contains only (slope, intercept), not popt/pcov
     calibrated_channels = [(k, h) for k, h in anode_hists.items() 
                            if k in calibrations and np.sum(h) > 100]
     
@@ -83,7 +82,7 @@ def plot_calibration_validation(anode_hists, bin_centers, calibrations, kev, n_s
         ax.step(kev_bins, hist, where='mid', color='blue', 
                 linewidth=1.5, label='Data', alpha=0.7)
         
-        # Try to fit (re-fit needed to get popt for plotting the model fit)
+        # Try to fit
         popt, pcov, bins_fit, hist_fit = fit_one_channel2(
             bin_centers, hist, auto_region=False, 
             lower_bound=1800, upper_bound=3200
@@ -343,7 +342,6 @@ def main():
     print("ADC TO KEV ENERGY CALIBRATION PIPELINE")
     print("="*70)
     
-    # calibrations will hold {channel_key: (slope, intercept)}
     calibrations = {}
     
     # ===== STEP 1: Build Anode Histograms =====
@@ -352,7 +350,6 @@ def main():
     print(f"{'='*70}")
     
     t0 = time.perf_counter()
-    # UPDATED: Changed function name from build_anode_histograms2 to the optimized one
     anode_hists1, anode_bin_centers1, cathode_anode_pairs1 = build_anode_histograms2(
         args.file1, verbose=True
     )
@@ -362,44 +359,79 @@ def main():
     t1 = time.perf_counter()
     
     print(f"\n✓ Anode histograms built in {t1-t0:.2f}s")
-    anode_hist_build_time = t1-t0 # Store build time
     
     # Diagnose histogram quality
     print("\nFile 1 diagnostics:")
     
     # ====== ADD BACK AFTER TESTING ====
-    good1, spike1, low1, empty1 = diagnose_anode_histograms(anode_hists1, anode_bin_centers1)
+    ##  good1, spike1, low1, empty1 = diagnose_anode_histograms(anode_hists1, anode_bin_centers1)
     print("\nFile 2 diagnostics:")
-    good2, spike2, low2, empty2 = diagnose_anode_histograms(anode_hists2, anode_bin_centers2)
+    ##  good2, spike2, low2, empty2 = diagnose_anode_histograms(anode_hists2, anode_bin_centers2)
     
     # ===================================
     
-    # ===== STEP 2: Fit Anode Channels (PARALLELIZED) =====
+    # ===== STEP 2: Fit Anode Channels =====
     print(f"\n{'='*70}")
-    print("STEP 2: FITTING ANODE PHOTOPEAKS (PARALLEL)")
+    print("STEP 2: FITTING ANODE PHOTOPEAKS")
     print(f"{'='*70}")
     
+    common_anode_channels = set(anode_hists1.keys()).intersection(set(anode_hists2.keys()))
+    print(f"\nCommon anode channels: {len(common_anode_channels)}")
+    
     t0 = time.perf_counter()
+    failed_fits = 0
     
-    # Call the new parallel function to execute the two-point calibration on all cores
-    calibrations_results, failed_fits_count = calibrate_anodes_in_parallel(
-        anode_hists1, anode_bin_centers1, args.kev1, 
-        anode_hists2, anode_bin_centers2, args.kev2, 
-        fit_one_channel2, extract_photopeak_info, # Pass the necessary functions
-        verbose=True
-    )
-    
-    # Update the main calibrations dictionary with successful results
-    calibrations.update(calibrations_results)
+    for channel in common_anode_channels:
+        hist1 = anode_hists1[channel]
+        hist2 = anode_hists2[channel]
+        
+        # Skip bad histograms
+        if np.count_nonzero(hist1) <= 1 or np.count_nonzero(hist2) <= 1:
+            failed_fits += 1
+            continue
+        
+        if np.sum(hist1) < 100 or np.sum(hist2) < 100:
+            failed_fits += 1
+            continue
+        
+        # Fit with wider bounds
+        popt1, pcov1, bins_fit1, hist_fit1 = fit_one_channel2(
+            anode_bin_centers1, hist1, auto_region=False, 
+            lower_bound=1800, upper_bound=3200
+        )
+        
+        popt2, pcov2, bins_fit2, hist_fit2 = fit_one_channel2(
+            anode_bin_centers2, hist2, auto_region=False,
+            lower_bound=1500, upper_bound=2800
+        )
+        
+        if popt1 is None or popt2 is None:
+            failed_fits += 1
+            continue
+        
+        peak_info1 = extract_photopeak_info(popt1, pcov1)
+        peak_info2 = extract_photopeak_info(popt2, pcov2)
+        adc1 = peak_info1['photopeak_position']
+        adc2 = peak_info2['photopeak_position']
+        
+        if adc1 <= 0 or adc2 <= 0 or abs(adc1 - adc2) < 50:
+            failed_fits += 1
+            continue
+        
+        slope = (args.kev1 - args.kev2) / (adc1 - adc2)
+        intercept = args.kev2 - slope * adc2
+        
+        if not np.isfinite(slope) or not np.isfinite(intercept) or slope <= 0 or slope > 2:
+            failed_fits += 1
+            continue
+        
+        calibrations[channel] = (slope, intercept)
     
     t1 = time.perf_counter()
-    anode_fit_time = t1-t0 # Store fit time
-    
-    total_common_channels = len(set(anode_hists1.keys()).intersection(set(anode_hists2.keys())))
-    success_rate = 100 * (len(calibrations) / max(1, total_common_channels))
-    
-    print(f"\n✓ Parallel anode fitting complete in {anode_fit_time:.2f}s")
-    print(f"  Success: {len(calibrations)}/{total_common_channels} ({success_rate:.1f}%)")
+    anode_hist_time = t1-t0
+    success_rate = 100 * (1 - failed_fits / len(common_anode_channels))
+    print(f"\n✓ Anode fitting complete in {t1-t0:.2f}s")
+    print(f"  Success: {len(calibrations)}/{len(common_anode_channels)} ({success_rate:.1f}%)")
     
     # ===== STEP 3: Build Cathode Histograms =====
     print(f"\n{'='*70}")
@@ -437,12 +469,10 @@ def main():
             failed_cathode += 1
             continue
         
-        # r[2] is the photopeak_adc/Compton edge
         slope = (args.kev1 - args.kev2) / (r1[2] - r2[2])
         intercept = args.kev2 - slope * r2[2]
         
         if np.isfinite(slope) and np.isfinite(intercept):
-            # Store cathode calibration
             calibrations[channel] = (slope, intercept)
         else:
             failed_cathode += 1
@@ -450,17 +480,11 @@ def main():
     t1 = time.perf_counter()
     cathode_success = 100 * (1 - failed_cathode / max(1, len(common_cathode_channels)))
     print(f"✓ Cathode fitting complete in {t1-t0:.2f}s")
-    print(f"  Success: {cathode_success:.1f} %")
+    print(f"  Success: {cathode_success:.1f}%")
     
     # ===== SAVE & VISUALIZE =====
     with open(args.out, "w") as f:
-        # Save (slope, intercept) tuples as a list of two floats
-        serializable_calibrations = {
-            str(k): list(v) if isinstance(v, tuple) else v 
-            for k, v in calibrations.items()
-        }
-        json.dump(serializable_calibrations, f, indent=2)
-        
+        json.dump({str(k): v for k, v in calibrations.items()}, f, indent=2)
     print(f"\n✓ Saved: {args.out}")
     
     print(f"\n{'='*70}")
@@ -475,9 +499,7 @@ def main():
     t_end = time.perf_counter()
     print()
     print(f"total run time: {t_end-t_start:0.2f} seconds")
-    # UPDATED: Display both build and parallel fit times
-    print(f"time to build anode hists: {anode_hist_build_time:.2f} seconds")
-    print(f"time to fit anode hists (parallel): {anode_fit_time:.2f} seconds")
+    print(f"time to build anode hists: {anode_hist_time} seconds")
     print()
     print(f"\n{'='*70}")
     print("COMPLETE")

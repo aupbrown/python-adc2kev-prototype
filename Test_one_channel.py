@@ -1,4 +1,4 @@
-from build_hists import build_anode_histograms
+from build_hists_opt import build_anode_histograms
 import matplotlib.pyplot as plt
 from anode_fit import plot_fit_components
 from anode_fit import fit_one_channel
@@ -318,6 +318,20 @@ kev_bin_centers2 = slope * bin_centers2 + intercept
 
 plt.figure(figsize=(10, 6))
 plt.step(kev_bin_centers1, hist1, where='mid', linewidth=1.5)
+plt.xlabel("KeV value", fontsize=12)
+plt.ylabel("Counts", fontsize=12)
+plt.title(f"Full Histogram: node={key[0]}, board={key[1]}, rena={key[2]}, channel={key[3]}")
+plt.ylim(bottom=0.5)
+plt.grid(alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+print("\n" + "="*60)
+print("Printing Ge-68 histogram with kev x-axis")
+print("="*60)
+
+plt.figure(figsize=(10, 6))
+plt.step(kev_bin_centers2, hist2, where='mid', linewidth=1.5)
 plt.xlabel("KeV value", fontsize=12)
 plt.ylabel("Counts", fontsize=12)
 plt.title(f"Full Histogram: node={key[0]}, board={key[1]}, rena={key[2]}, channel={key[3]}")
